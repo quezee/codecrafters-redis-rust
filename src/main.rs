@@ -8,10 +8,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         match stream {
             Ok(mut stream) => {
                 println!("accepted new connection");
-                let mut buf = vec![];
-                let bytes_read = stream.read(&mut buf)?;
-                println!("read bytes: {bytes_read}");
-                stream.write_all(b"+PONG\r\n")?;
+                loop {
+                    let mut buf: Vec<u8> = vec![];
+                    let bytes_read = stream.read_to_end(&mut buf)?;
+                    println!("read bytes: {bytes_read}");
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    stream.write_all(b"+PONG\r\n")?;
+                }
             }
             Err(e) => {
                 println!("error: {}", e);
