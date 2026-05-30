@@ -1,18 +1,16 @@
 #![allow(unused_imports)]
-use std::{io::Write, net::TcpListener};
+use std::{error::Error, io::{Read, Write}, net::TcpListener};
 
-fn main() {
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-    println!("Logs from your program will appear here!");
-
-    // Uncomment the code below to pass the first stage
-    
+fn main() -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
     
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
                 println!("accepted new connection");
+                let mut buf = vec![];
+                let bytes_read = stream.read_to_end(&mut buf)?;
+                println!("read bytes: {bytes_read}");
                 stream.write_all(b"+PONG\r\n").expect("write failed");
             }
             Err(e) => {
@@ -20,4 +18,5 @@ fn main() {
             }
         }
     }
+    Ok(())
 }
