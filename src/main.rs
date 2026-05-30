@@ -9,9 +9,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok(mut stream) => {
                 println!("accepted new connection");
                 let mut buf = vec![];
-                let bytes_read = stream.read_to_end(&mut buf)?;
+                let bytes_read = stream.read(&mut buf)?;
                 println!("read bytes: {bytes_read}");
-                stream.write_all(b"+PONG\r\n").expect("write failed");
+                stream.write_all(b"+PONG\r\n")?;
             }
             Err(e) => {
                 println!("error: {}", e);
