@@ -1,10 +1,12 @@
-use std::{num::{ParseIntError, IntErrorKind}, string::FromUtf8Error};
+use std::{io, num::{ParseIntError, IntErrorKind}, string::FromUtf8Error};
 
 #[derive(Debug, PartialEq, Eq)]
 enum Value {
     Str(String),
     Err(String),
-    Int(i64)
+    Int(i64),
+    BulkStr(String),
+    Arr(Vec<Value>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -13,8 +15,9 @@ enum RespError {
         expected: u8,
         actual: u8
     },
+    UnknownStartingByte(u8),
     IO{
-       kind: std::io::ErrorKind,
+       kind: io::ErrorKind,
        msg: Option<String> 
     },
     FromUtf8(FromUtf8Error),
@@ -22,8 +25,8 @@ enum RespError {
     BulkStrLen{declared: usize, actual: usize},
 }
 
-impl From<std::io::Error> for RespError {
-    fn from(value: std::io::Error) -> Self {
+impl From<io::Error> for RespError {
+    fn from(value: io::Error) -> Self {
         Self::IO { kind: value.kind(), msg: Some(value.to_string()) }
     }
 }
@@ -43,9 +46,9 @@ impl From<ParseIntError> for RespError {
 trait Parser {
     const STARTING_BYTE: u8;
 
-    fn deserialize<R: std::io::BufRead>(reader: &mut R) -> Result<Value, RespError>;
+    fn deserialize<R: io::BufRead>(reader: &mut R) -> Result<Value, RespError>;
 
-    fn check_starting_byte<R: std::io::BufRead>(reader: &mut R, control_byte: &mut [u8]) -> Result<(), RespError> {
+    fn check_starting_byte<R: io::BufRead>(reader: &mut R, control_byte: &mut [u8]) -> Result<(), RespError> {
         reader.read_exact(control_byte)?;
         if control_byte[0] != Self::STARTING_BYTE {
             return Err(RespError::StartingByte{expected: Self::STARTING_BYTE, actual: control_byte[0]});
@@ -53,7 +56,15 @@ trait Parser {
         Ok(())
     }
 
-    fn read_until_crlf<R: std::io::BufRead>(reader: &mut R, control_byte: &mut [u8]) -> Result<Vec<u8>, RespError> {
+    fn peek_next_byte<R: io::BufRead>(reader: &mut R) -> io::Result<u8> {
+        let buf = reader.fill_buf()?;
+        match buf.first() {
+            Some(byte) => Ok(*byte),
+            None => Err(io::Error::from(io::ErrorKind::UnexpectedEof))
+        }
+    }
+
+    fn read_until_crlf<R: io::BufRead>(reader: &mut R, control_byte: &mut [u8]) -> Result<Vec<u8>, RespError> {
         let mut buf = vec![];
 
         reader.read_until(b'\r', &mut buf)?;
@@ -72,7 +83,7 @@ trait Parser {
         Ok(buf)
     }
 
-    fn deserialize_str<R: std::io::BufRead>(reader: &mut R) -> Result<String, RespError> {
+    fn deserialize_str<R: io::BufRead>(reader: &mut R) -> Result<String, RespError> {
         let mut control_byte = [0u8];
         Self::check_starting_byte(reader, &mut control_byte)?;
 
@@ -80,13 +91,20 @@ trait Parser {
         let result = String::from_utf8(buf)?;
         Ok(result)
     }
+
+    fn deserialize_len<R: io::BufRead>(reader: &mut R, control_byte: &mut [u8]) -> Result<usize, RespError> {
+        let buf = Self::read_until_crlf(reader, control_byte)?;
+        let buf_str = String::from_utf8(buf)?;
+        let len = buf_str.parse::<usize>()?;
+        Ok(len)
+    }
 }
 
 struct StrParser;
 impl Parser for StrParser {
     const STARTING_BYTE: u8 = b'+';
 
-    fn deserialize<R: std::io::BufRead>(reader: &mut R) -> Result<Value, RespError> {
+    fn deserialize<R: io::BufRead>(reader: &mut R) -> Result<Value, RespError> {
         let result = Self::deserialize_str(reader)?;
         Ok(Value::Str(result))
     }
@@ -96,7 +114,7 @@ struct ErrParser;
 impl Parser for ErrParser {
     const STARTING_BYTE: u8 = b'-';
 
-    fn deserialize<R: std::io::BufRead>(reader: &mut R) -> Result<Value, RespError> {
+    fn deserialize<R: io::BufRead>(reader: &mut R) -> Result<Value, RespError> {
         let result = Self::deserialize_str(reader)?;
         Ok(Value::Err(result))
     }
@@ -106,7 +124,7 @@ struct IntParser;
 impl Parser for IntParser {
     const STARTING_BYTE: u8 = b':';
 
-    fn deserialize<R: std::io::BufRead>(reader: &mut R) -> Result<Value, RespError> {
+    fn deserialize<R: io::BufRead>(reader: &mut R) -> Result<Value, RespError> {
         let mut control_byte = [0u8];
         Self::check_starting_byte(reader, &mut control_byte)?;
 
@@ -121,20 +139,54 @@ struct BulkStrParser;
 impl Parser for BulkStrParser {
     const STARTING_BYTE: u8 = b'$';
 
-    fn deserialize<R: std::io::BufRead>(reader: &mut R) -> Result<Value, RespError> {
+    fn deserialize<R: io::BufRead>(reader: &mut R) -> Result<Value, RespError> {
         let mut control_byte = [0u8];
         Self::check_starting_byte(reader, &mut control_byte)?;
 
-        let buf = Self::read_until_crlf(reader, &mut control_byte)?;
-        let buf_str = String::from_utf8(buf)?;
-        let str_len = buf_str.parse::<usize>()?;
-        
+        let str_len = Self::deserialize_len(reader, &mut control_byte)?;
         let buf = Self::read_until_crlf(reader, &mut control_byte)?;
         if buf.len() != str_len {
             return Err(RespError::BulkStrLen{declared: str_len, actual: buf.len()});
         }
         let result = String::from_utf8(buf)?;
-        Ok(Value::Str(result))
+        Ok(Value::BulkStr(result))
+    }
+}
+
+struct ArrParser;
+impl Parser for ArrParser {
+    const STARTING_BYTE: u8 = b'*';
+
+    fn deserialize<R: io::BufRead>(reader: &mut R) -> Result<Value, RespError> {
+        let mut control_byte = [0u8];
+        Self::check_starting_byte(reader, &mut control_byte)?;
+
+        let arr_len = Self::deserialize_len(reader, &mut control_byte)?;
+        let mut values = vec![];
+        values.reserve(arr_len);
+
+        for _ in 0..arr_len {
+            let next_value = AnyParser::deserialize(reader)?;
+            values.push(next_value);
+        }
+        Ok(Value::Arr(values))
+    }
+}
+
+struct AnyParser;
+impl Parser for AnyParser {
+    const STARTING_BYTE: u8 = b'0';
+
+    fn deserialize<R: io::BufRead>(reader: &mut R) -> Result<Value, RespError> {
+        let next_byte = Self::peek_next_byte(reader)?;
+        match next_byte {
+            StrParser::STARTING_BYTE => StrParser::deserialize(reader),
+            ErrParser::STARTING_BYTE => ErrParser::deserialize(reader),
+            IntParser::STARTING_BYTE => IntParser::deserialize(reader),
+            BulkStrParser::STARTING_BYTE => BulkStrParser::deserialize(reader),
+            ArrParser::STARTING_BYTE => ArrParser::deserialize(reader),
+            other => Err(RespError::UnknownStartingByte(other))
+        }
     }
 }
 
@@ -142,7 +194,7 @@ impl Parser for BulkStrParser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use io::Cursor;
 
     #[test]
     fn test_str_parser() {
@@ -228,7 +280,84 @@ mod tests {
             let mut cursor = Cursor::new(b"$14\r\ncorrect\ncase\n\r\r\n");
             let result = BulkStrParser::deserialize(&mut cursor);
             assert!(result.is_ok());
-            assert_eq!(result.unwrap(), Value::Str("correct\ncase\n\r".into()));
+            assert_eq!(result.unwrap(), Value::BulkStr("correct\ncase\n\r".into()));
+        }
+    }
+
+    #[test]
+    fn test_arr_parser() {
+        {   // wrong starting byte
+            let mut cursor = Cursor::new(b"+3\r\n$4\r\nsome\r\n+number\r\n:321\r\n");
+            let result = ArrParser::deserialize(&mut cursor);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), RespError::StartingByte { expected: b'*', actual: b'+' });
+        }
+        {   // correct case 1 [BulkStr, Str, Int]
+            let mut cursor = Cursor::new(b"*3\r\n$4\r\nsome\r\n+number\r\n:321\r\n");
+            let result = ArrParser::deserialize(&mut cursor);
+            assert!(result.is_ok());
+            let expected = Value::Arr(vec![
+                Value::BulkStr("some".into()),
+                Value::Str("number".into()),
+                Value::Int(321),
+            ]);
+            assert_eq!(result.unwrap(), expected);
+        }
+        {   // correct case 2 [[Int, Int, Int], [Str, Str], [Err]]
+            let mut cursor = Cursor::new(b"*3\r\n*3\r\n:1\r\n:2\r\n:3\r\n*2\r\n+Hello\r\n+World\r\n*1\r\n-some error\r\n");
+            let result = ArrParser::deserialize(&mut cursor);
+            assert!(result.is_ok());
+            let expected = Value::Arr(vec![
+                Value::Arr(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+                Value::Arr(vec![Value::Str("Hello".into()), Value::Str("World".into())]),
+                Value::Arr(vec![Value::Err("some error".into())]),
+            ]);
+            assert_eq!(result.unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_any_parser() {
+        {   // wrong starting byte
+            let mut cursor = Cursor::new(b"!\r\nwrong start\r\n");
+            let result = AnyParser::deserialize(&mut cursor);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), RespError::UnknownStartingByte(b'!'));
+        }
+        {   // correct case (Str)
+            let mut cursor = Cursor::new(b"+with \r in the end\r\r\n");
+            let result = AnyParser::deserialize(&mut cursor);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), Value::Str("with \r in the end\r".into()));
+        }
+        {   // correct case (Err)
+            let mut cursor = Cursor::new(b"-some\nerror\n\r\r\n");
+            let result = AnyParser::deserialize(&mut cursor);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), Value::Err("some\nerror\n\r".into()));
+        }
+        {   // correct case (Int)
+            let mut cursor = Cursor::new(b":12345678\r\n");
+            let result = AnyParser::deserialize(&mut cursor);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), Value::Int(12345678));
+        }
+        {   // correct case (BulkStr)
+            let mut cursor = Cursor::new(b"$14\r\ncorrect\ncase\n\r\r\n");
+            let result = AnyParser::deserialize(&mut cursor);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), Value::BulkStr("correct\ncase\n\r".into()));
+        }
+        {   // correct case (Arr)
+            let mut cursor = Cursor::new(b"*3\r\n*3\r\n:1\r\n:2\r\n:3\r\n*2\r\n+Hello\r\n+World\r\n*1\r\n-some error\r\n");
+            let result = AnyParser::deserialize(&mut cursor);
+            assert!(result.is_ok());
+            let expected = Value::Arr(vec![
+                Value::Arr(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+                Value::Arr(vec![Value::Str("Hello".into()), Value::Str("World".into())]),
+                Value::Arr(vec![Value::Err("some error".into())]),
+            ]);
+            assert_eq!(result.unwrap(), expected);
         }
     }
 
