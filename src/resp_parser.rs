@@ -1,16 +1,9 @@
 use std::{io, num::{ParseIntError, IntErrorKind}, string::FromUtf8Error};
+use crate::resp_value::Value;
+
 
 #[derive(Debug, PartialEq, Eq)]
-enum Value {
-    Str(String),
-    Err(String),
-    Int(i64),
-    BulkStr(String),
-    Arr(Vec<Value>),
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum RespError {
+pub enum RespError {
     StartingByte{
         expected: u8,
         actual: u8
@@ -43,7 +36,7 @@ impl From<ParseIntError> for RespError {
     }
 }
 
-trait Parser {
+pub trait Parser {
     const STARTING_BYTE: u8;
 
     fn deserialize<R: io::BufRead>(reader: &mut R) -> Result<Value, RespError>;
@@ -173,7 +166,7 @@ impl Parser for ArrParser {
     }
 }
 
-struct AnyParser;
+pub struct AnyParser;
 impl Parser for AnyParser {
     const STARTING_BYTE: u8 = b'0';
 
