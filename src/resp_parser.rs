@@ -15,7 +15,7 @@ pub enum RespError {
     },
     FromUtf8(FromUtf8Error),
     ParseInt(IntErrorKind),
-    BulkStrLen{declared: usize, actual: usize},
+    WrongArrayEnding([u8; 2]),
 }
 
 impl From<io::Error> for RespError {
@@ -93,7 +93,7 @@ pub trait Parser {
     }
 }
 
-struct StrParser;
+pub struct StrParser;
 impl Parser for StrParser {
     const STARTING_BYTE: u8 = b'+';
 
@@ -103,7 +103,7 @@ impl Parser for StrParser {
     }
 }
 
-struct ErrParser;
+pub struct ErrParser;
 impl Parser for ErrParser {
     const STARTING_BYTE: u8 = b'-';
 
@@ -113,7 +113,7 @@ impl Parser for ErrParser {
     }
 }
 
-struct IntParser;
+pub struct IntParser;
 impl Parser for IntParser {
     const STARTING_BYTE: u8 = b':';
 
@@ -128,7 +128,7 @@ impl Parser for IntParser {
     }
 }
 
-struct BulkStrParser;
+pub struct BulkStrParser;
 impl Parser for BulkStrParser {
     const STARTING_BYTE: u8 = b'$';
 
@@ -137,16 +137,21 @@ impl Parser for BulkStrParser {
         Self::check_starting_byte(reader, &mut control_byte)?;
 
         let str_len = Self::deserialize_len(reader, &mut control_byte)?;
-        let buf = Self::read_until_crlf(reader, &mut control_byte)?;
-        if buf.len() != str_len {
-            return Err(RespError::BulkStrLen{declared: str_len, actual: buf.len()});
+        let mut buf = vec![0u8; str_len];
+        reader.read_exact(&mut buf)?;
+
+        let mut ending_bytes = [0u8; 2];
+        reader.read_exact(&mut ending_bytes)?;
+        if &ending_bytes != b"\r\n" {
+            return Err(RespError::WrongArrayEnding(ending_bytes));
         }
+
         let result = String::from_utf8(buf)?;
         Ok(Value::BulkStr(result))
     }
 }
 
-struct ArrParser;
+pub struct ArrParser;
 impl Parser for ArrParser {
     const STARTING_BYTE: u8 = b'*';
 
@@ -264,16 +269,16 @@ mod tests {
             assert_eq!(result.unwrap_err(), RespError::StartingByte { expected: b'$', actual: b'+' });
         }
         {   // wrong declared len
-            let mut cursor = Cursor::new(b"$10\r\nwrong len\r\n");
+            let mut cursor = Cursor::new(b"$8\r\nwrong len\r\n");
             let result = BulkStrParser::deserialize(&mut cursor);
             assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), RespError::BulkStrLen { declared: 10, actual: 9 });
+            assert_eq!(result.unwrap_err(), RespError::WrongArrayEnding(*b"n\r"));
         }
-        {   // correct case
-            let mut cursor = Cursor::new(b"$14\r\ncorrect\ncase\n\r\r\n");
+        {   // correct case (with CRLF in the middle)
+            let mut cursor = Cursor::new(b"$15\r\ncorrect\r\ncase\n\r\r\n");
             let result = BulkStrParser::deserialize(&mut cursor);
             assert!(result.is_ok());
-            assert_eq!(result.unwrap(), Value::BulkStr("correct\ncase\n\r".into()));
+            assert_eq!(result.unwrap(), Value::BulkStr("correct\r\ncase\n\r".into()));
         }
     }
 
