@@ -11,7 +11,7 @@ pub enum RespError {
     UnknownStartingByte(u8),
     IO{
        kind: io::ErrorKind,
-       msg: Option<String> 
+       msg: Option<String>
     },
     FromUtf8(FromUtf8Error),
     ParseInt(IntErrorKind),
@@ -86,6 +86,17 @@ pub trait Parser {
         Ok(result)
     }
 
+    fn deserialize_null<R: io::BufRead>(reader: &mut R) -> Result<(), RespError> {
+        // `-1\r\n` expected
+        let mut null_val_buf = [0u8; 4];
+        reader.read_exact(&mut null_val_buf)?;
+        if &null_val_buf == b"-1\r\n" {
+            return Ok(());
+        } else {
+            return Err(RespError::WrongNullValue(null_val_buf));
+        }
+    }
+
     fn deserialize_len<R: io::BufRead>(reader: &mut R, control_byte: &mut [u8]) -> Result<usize, RespError> {
         let buf = Self::read_until_crlf(reader, control_byte)?;
         let buf_str = String::from_utf8(buf)?;
@@ -139,14 +150,8 @@ impl Parser for BulkStrParser {
 
         let next_byte = Self::peek_next_byte(reader)?;
         if next_byte == b'-' {
-            // null value processing (`-1\r\n` expected)
-            let mut null_val_buf = [0u8; 4];
-            reader.read_exact(&mut null_val_buf)?;
-            if &null_val_buf == b"-1\r\n" {
-                return Ok(Value::Null);
-            } else {
-                return Err(RespError::WrongNullValue(null_val_buf));
-            }
+            Self::deserialize_null(reader)?;
+            return Ok(Value::BulkStr(None));
         }
 
         let str_len = Self::deserialize_len(reader, &mut control_byte)?;
@@ -160,7 +165,7 @@ impl Parser for BulkStrParser {
         }
 
         let result = String::from_utf8(buf)?;
-        Ok(Value::BulkStr(result))
+        Ok(Value::BulkStr(Some(result)))
     }
 }
 
@@ -172,6 +177,12 @@ impl Parser for ArrParser {
         let mut control_byte = [0u8];
         Self::check_starting_byte(reader, &mut control_byte)?;
 
+        let next_byte = Self::peek_next_byte(reader)?;
+        if next_byte == b'-' {
+            Self::deserialize_null(reader)?;
+            return Ok(Value::Arr(None));
+        }
+
         let arr_len = Self::deserialize_len(reader, &mut control_byte)?;
         let mut values = vec![];
         values.reserve(arr_len);
@@ -180,7 +191,7 @@ impl Parser for ArrParser {
             let next_value = AnyParser::deserialize(reader)?;
             values.push(next_value);
         }
-        Ok(Value::Arr(values))
+        Ok(Value::Arr(Some(values)))
     }
 }
 
@@ -315,19 +326,19 @@ mod tests {
             let mut cursor = Cursor::new(b"$-1\r\n");
             let result = BulkStrParser::deserialize(&mut cursor);
             assert!(result.is_ok());
-            assert_eq!(result.unwrap(), Value::Null);
+            assert_eq!(result.unwrap(), Value::BulkStr(None));
         }
         {   // correct empty string
             let mut cursor = Cursor::new(b"$0\r\n\r\n");
             let result = BulkStrParser::deserialize(&mut cursor);
             assert!(result.is_ok());
-            assert_eq!(result.unwrap(), Value::BulkStr("".into()));
+            assert_eq!(result.unwrap(), Value::BulkStr(Some("".into())));
         }
         {   // correct case (with CRLF in the middle)
             let mut cursor = Cursor::new(b"$15\r\ncorrect\r\ncase\n\r\r\n");
             let result = BulkStrParser::deserialize(&mut cursor);
             assert!(result.is_ok());
-            assert_eq!(result.unwrap(), Value::BulkStr("correct\r\ncase\n\r".into()));
+            assert_eq!(result.unwrap(), Value::BulkStr(Some("correct\r\ncase\n\r".into())));
         }
     }
 
@@ -339,32 +350,44 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(result.unwrap_err(), RespError::StartingByte { expected: b'*', actual: b'+' });
         }
+        {   // incorrect null array
+            let mut cursor = Cursor::new(b"*-111\r\n");
+            let result = ArrParser::deserialize(&mut cursor);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), RespError::WrongNullValue(*b"-111"));
+        }
+        {   // correct null array
+            let mut cursor = Cursor::new(b"*-1\r\n");
+            let result = ArrParser::deserialize(&mut cursor);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), Value::Arr(None));
+        }
         {   // correct empty array
             let mut cursor = Cursor::new(b"*0\r\n\r\n");
             let result = ArrParser::deserialize(&mut cursor);
             assert!(result.is_ok());
-            assert_eq!(result.unwrap(), Value::Arr(vec![]));
+            assert_eq!(result.unwrap(), Value::Arr(Some(vec![])));
         }
         {   // correct case 1 [BulkStr, Str, Int]
             let mut cursor = Cursor::new(b"*3\r\n$4\r\nsome\r\n+number\r\n:321\r\n");
             let result = ArrParser::deserialize(&mut cursor);
             assert!(result.is_ok());
-            let expected = Value::Arr(vec![
-                Value::BulkStr("some".into()),
+            let expected = Value::Arr(Some(vec![
+                Value::BulkStr(Some("some".into())),
                 Value::Str("number".into()),
                 Value::Int(321),
-            ]);
+            ]));
             assert_eq!(result.unwrap(), expected);
         }
         {   // correct case 2 [[Int, Int, Int], [Str, Str], [Err]]
             let mut cursor = Cursor::new(b"*3\r\n*3\r\n:1\r\n:2\r\n:3\r\n*2\r\n+Hello\r\n+World\r\n*1\r\n-some error\r\n");
             let result = ArrParser::deserialize(&mut cursor);
             assert!(result.is_ok());
-            let expected = Value::Arr(vec![
-                Value::Arr(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
-                Value::Arr(vec![Value::Str("Hello".into()), Value::Str("World".into())]),
-                Value::Arr(vec![Value::Err("some error".into())]),
-            ]);
+            let expected = Value::Arr(Some(vec![
+                Value::Arr(Some(vec![Value::Int(1), Value::Int(2), Value::Int(3)])),
+                Value::Arr(Some(vec![Value::Str("Hello".into()), Value::Str("World".into())])),
+                Value::Arr(Some(vec![Value::Err("some error".into())])),
+            ]));
             assert_eq!(result.unwrap(), expected);
         }
     }
@@ -399,17 +422,17 @@ mod tests {
             let mut cursor = Cursor::new(b"$14\r\ncorrect\ncase\n\r\r\n");
             let result = AnyParser::deserialize(&mut cursor);
             assert!(result.is_ok());
-            assert_eq!(result.unwrap(), Value::BulkStr("correct\ncase\n\r".into()));
+            assert_eq!(result.unwrap(), Value::BulkStr(Some("correct\ncase\n\r".into())));
         }
         {   // correct case (Arr)
             let mut cursor = Cursor::new(b"*3\r\n*3\r\n:1\r\n:2\r\n:3\r\n*2\r\n+Hello\r\n+World\r\n*1\r\n-some error\r\n");
             let result = AnyParser::deserialize(&mut cursor);
             assert!(result.is_ok());
-            let expected = Value::Arr(vec![
-                Value::Arr(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
-                Value::Arr(vec![Value::Str("Hello".into()), Value::Str("World".into())]),
-                Value::Arr(vec![Value::Err("some error".into())]),
-            ]);
+            let expected = Value::Arr(Some(vec![
+                Value::Arr(Some(vec![Value::Int(1), Value::Int(2), Value::Int(3)])),
+                Value::Arr(Some(vec![Value::Str("Hello".into()), Value::Str("World".into())])),
+                Value::Arr(Some(vec![Value::Err("some error".into())])),
+            ]));
             assert_eq!(result.unwrap(), expected);
         }
     }
