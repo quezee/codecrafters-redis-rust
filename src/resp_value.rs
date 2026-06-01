@@ -4,6 +4,7 @@ pub enum Value {
     Err(String),
     Int(i64),
     BulkStr(String),
+    Null,
     Arr(Vec<Value>),
 }
 

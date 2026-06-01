@@ -15,7 +15,8 @@ pub enum RespError {
     },
     FromUtf8(FromUtf8Error),
     ParseInt(IntErrorKind),
-    WrongArrayEnding([u8; 2]),
+    WrongNullValue([u8; 4]),
+    WrongBulkStrEnding([u8; 2]),
 }
 
 impl From<io::Error> for RespError {
@@ -136,6 +137,18 @@ impl Parser for BulkStrParser {
         let mut control_byte = [0u8];
         Self::check_starting_byte(reader, &mut control_byte)?;
 
+        let next_byte = Self::peek_next_byte(reader)?;
+        if next_byte == b'-' {
+            // null value processing (`-1\r\n` expected)
+            let mut null_val_buf = [0u8; 4];
+            reader.read_exact(&mut null_val_buf)?;
+            if &null_val_buf == b"-1\r\n" {
+                return Ok(Value::Null);
+            } else {
+                return Err(RespError::WrongNullValue(null_val_buf));
+            }
+        }
+
         let str_len = Self::deserialize_len(reader, &mut control_byte)?;
         let mut buf = vec![0u8; str_len];
         reader.read_exact(&mut buf)?;
@@ -143,7 +156,7 @@ impl Parser for BulkStrParser {
         let mut ending_bytes = [0u8; 2];
         reader.read_exact(&mut ending_bytes)?;
         if &ending_bytes != b"\r\n" {
-            return Err(RespError::WrongArrayEnding(ending_bytes));
+            return Err(RespError::WrongBulkStrEnding(ending_bytes));
         }
 
         let result = String::from_utf8(buf)?;
@@ -202,6 +215,12 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(result.unwrap_err(), RespError::StartingByte { expected: b'+', actual: b'-' });
         }
+        {   // correct empty string
+            let mut cursor = Cursor::new(b"+\r\n");
+            let result = StrParser::deserialize(&mut cursor);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), Value::Str("".into()));
+        }
         {   // simple case
             let mut cursor = Cursor::new(b"+simple case\r\n");
             let result = StrParser::deserialize(&mut cursor);
@@ -230,6 +249,12 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(result.unwrap_err(), RespError::StartingByte { expected: b'-', actual: b'+' });
         }
+        {   // correct empty string
+            let mut cursor = Cursor::new(b"-\r\n");
+            let result = ErrParser::deserialize(&mut cursor);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), Value::Err("".into()));
+        }
         {   // simple case
             let mut cursor = Cursor::new(b"-simple case\r\n");
             let result = ErrParser::deserialize(&mut cursor);
@@ -252,6 +277,12 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(result.unwrap_err(), RespError::ParseInt(IntErrorKind::InvalidDigit));
         }
+        {   // empty string (incorrect)
+            let mut cursor = Cursor::new(b":\r\n");
+            let result = IntParser::deserialize(&mut cursor);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), RespError::ParseInt(IntErrorKind::Empty));
+        }
         {   // correct int
             let mut cursor = Cursor::new(b":123\r\n");
             let result = IntParser::deserialize(&mut cursor);
@@ -272,7 +303,25 @@ mod tests {
             let mut cursor = Cursor::new(b"$8\r\nwrong len\r\n");
             let result = BulkStrParser::deserialize(&mut cursor);
             assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), RespError::WrongArrayEnding(*b"n\r"));
+            assert_eq!(result.unwrap_err(), RespError::WrongBulkStrEnding(*b"n\r"));
+        }
+        {   // incorrect null value
+            let mut cursor = Cursor::new(b"$-10\r\n");
+            let result = BulkStrParser::deserialize(&mut cursor);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), RespError::WrongNullValue(*b"-10\r"));
+        }
+        {   // correct null value
+            let mut cursor = Cursor::new(b"$-1\r\n");
+            let result = BulkStrParser::deserialize(&mut cursor);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), Value::Null);
+        }
+        {   // correct empty string
+            let mut cursor = Cursor::new(b"$0\r\n\r\n");
+            let result = BulkStrParser::deserialize(&mut cursor);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), Value::BulkStr("".into()));
         }
         {   // correct case (with CRLF in the middle)
             let mut cursor = Cursor::new(b"$15\r\ncorrect\r\ncase\n\r\r\n");
@@ -289,6 +338,12 @@ mod tests {
             let result = ArrParser::deserialize(&mut cursor);
             assert!(result.is_err());
             assert_eq!(result.unwrap_err(), RespError::StartingByte { expected: b'*', actual: b'+' });
+        }
+        {   // correct empty array
+            let mut cursor = Cursor::new(b"*0\r\n\r\n");
+            let result = ArrParser::deserialize(&mut cursor);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), Value::Arr(vec![]));
         }
         {   // correct case 1 [BulkStr, Str, Int]
             let mut cursor = Cursor::new(b"*3\r\n$4\r\nsome\r\n+number\r\n:321\r\n");
