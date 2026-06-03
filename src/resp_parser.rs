@@ -363,7 +363,7 @@ mod tests {
             assert_eq!(result.unwrap(), Value::Arr(None));
         }
         {   // correct empty array
-            let mut cursor = Cursor::new(b"*0\r\n\r\n");
+            let mut cursor = Cursor::new(b"*0\r\n");
             let result = ArrParser::deserialize(&mut cursor);
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), Value::Arr(Some(vec![])));

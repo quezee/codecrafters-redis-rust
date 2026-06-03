@@ -65,12 +65,8 @@ impl Value {
             Some(arr) => {
                 writer.write_all(arr.len().to_string().as_bytes())?;
                 writer.write_all(b"\r\n")?;
-                if arr.is_empty() {
-                    writer.write_all(b"\r\n")?;
-                } else {
-                    for val in arr {
-                        val.serialize(writer)?;
-                    }
+                for val in arr {
+                    val.serialize(writer)?;
                 }
             },
             None => {
@@ -164,7 +160,7 @@ use super::*;
         {   // empty arr
             let value = Value::Arr(Some(vec![]));
             let mut cursor = serialize_and_rewind(value);
-            assert_eq!(cursor.fill_buf().unwrap(), b"*0\r\n\r\n");
+            assert_eq!(cursor.fill_buf().unwrap(), b"*0\r\n");
         }
         {   // non-empty case 1 [BulkStr, Str, Int]
             let value = Value::Arr(Some(vec![
