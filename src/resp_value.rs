@@ -1,7 +1,6 @@
 use std::io;
+use crate::Bytes;
 use crate::resp_parser::{ArrParser, BulkStrParser, ErrParser, IntParser, Parser, StrParser};
-
-type Bytes = Vec<u8>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {

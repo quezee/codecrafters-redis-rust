@@ -1,8 +1,9 @@
+use crate::Storage;
 use crate::resp_value::Value;
 use crate::resp_parser::RespError;
 
 
-pub fn handle_request(request: Value) -> Result<Value, RespError> {
+pub fn handle_request(request: Value, storage: &Storage) -> Result<Value, RespError> {
     if let Value::Arr(Some(arr)) = request {
         if arr.is_empty() {
             return Ok(Value::Err("request should be non-empty array".into()))
@@ -41,21 +42,21 @@ mod tests {
     #[test]
     fn test_req_is_not_array() {
         let request = Value::BulkStr(Some("hey there".into()));
-        let response = handle_request(request);
+        let response = handle_request(request, &Storage::default());
         assert_eq!(response, Ok(Value::Err("request should be a non-null RESP array of bulk strings".into())));
     }
 
     #[test]
     fn test_req_is_null_array() {
         let request = Value::Arr(None);
-        let response = handle_request(request);
+        let response = handle_request(request, &Storage::default());
         assert_eq!(response, Ok(Value::Err("request should be a non-null RESP array of bulk strings".into())));
     }
 
     #[test]
     fn test_req_is_empty_array() {
         let request = Value::Arr(Some(vec![]));
-        let response = handle_request(request);
+        let response = handle_request(request, &Storage::default());
         assert_eq!(response, Ok(Value::Err("request should be non-empty array".into())));
     }
 
@@ -67,7 +68,7 @@ mod tests {
         let request = Value::Arr(Some(vec![
             Value::BulkStr(Some(invalid_cmd))
         ]));
-        let response = handle_request(request);
+        let response = handle_request(request, &Storage::default());
         assert_eq!(response, Err(RespError::FromUtf8(expected_err)));
     }
 
@@ -76,7 +77,7 @@ mod tests {
         let request = Value::Arr(Some(vec![
             Value::BulkStr(Some("PiNg".into()))
         ]));
-        let response = handle_request(request);
+        let response = handle_request(request, &Storage::default());
         assert_eq!(response, Ok(Value::Str("PONG".into())));
     }
 
@@ -86,7 +87,7 @@ mod tests {
             let request = Value::Arr(Some(vec![
                 Value::BulkStr(Some("eChO".into()))
             ]));
-            let response = handle_request(request);
+            let response = handle_request(request, &Storage::default());
             assert_eq!(response, Ok(Value::Err("ECHO with no argument received".into())));
         }
         {   // echo with wrong argument
@@ -94,7 +95,7 @@ mod tests {
                 Value::BulkStr(Some("eChO".into())),
                 Value::Str("hello".into())
             ]));
-            let response = handle_request(request);
+            let response = handle_request(request, &Storage::default());
             assert_eq!(response, Ok(Value::Err("ECHO's argument should be a bulk string".into())));
         }
         {   // echo with correct argument
@@ -102,7 +103,7 @@ mod tests {
                 Value::BulkStr(Some("eChO".into())),
                 Value::BulkStr(Some("hello".into()))
             ]));
-            let response = handle_request(request);
+            let response = handle_request(request, &Storage::default());
             assert_eq!(response, Ok(Value::BulkStr(Some("hello".into()))));
         }
     }
