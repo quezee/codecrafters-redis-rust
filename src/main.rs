@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     loop {
                         let mut stream_reader = io::BufReader::new(stream.try_clone()?);
                         let request = AnyParser::deserialize(&mut stream_reader)?;
-                        let response = handle_request(request);
+                        let response = handle_request(request)?;
                         response.serialize(&mut stream)?;
                     }
                 });

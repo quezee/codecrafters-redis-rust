@@ -164,8 +164,7 @@ impl Parser for BulkStrParser {
             return Err(RespError::WrongBulkStrEnding(ending_bytes));
         }
 
-        let result = String::from_utf8(buf)?;
-        Ok(Value::BulkStr(Some(result)))
+        Ok(Value::BulkStr(Some(buf)))
     }
 }
 

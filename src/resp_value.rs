@@ -1,12 +1,14 @@
 use std::io;
 use crate::resp_parser::{ArrParser, BulkStrParser, ErrParser, IntParser, Parser, StrParser};
 
+type Bytes = Vec<u8>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     Str(String),
     Err(String),
     Int(i64),
-    BulkStr(Option<String>),
+    BulkStr(Option<Bytes>),
     Arr(Option<Vec<Value>>),
 }
 
@@ -43,13 +45,13 @@ impl Value {
         Ok(())
     }
 
-    fn serialize_bulk_str<W: io::Write>(writer: &mut W, s: &Option<String>) -> io::Result<()> {
+    fn serialize_bulk_str<W: io::Write>(writer: &mut W, s: &Option<Bytes>) -> io::Result<()> {
         writer.write_all(&[BulkStrParser::STARTING_BYTE])?;
         match s {
             Some(s) => {
                 writer.write_all(s.len().to_string().as_bytes())?;
                 writer.write_all(b"\r\n")?;
-                writer.write_all(s.as_bytes())?;
+                writer.write_all(s)?;
             },
             None => {
                 writer.write_all(b"-1")?;
