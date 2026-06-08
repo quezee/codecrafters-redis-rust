@@ -1,7 +1,7 @@
 use std::io;
 use crate::resp_parser::{ArrParser, BulkStrParser, ErrParser, IntParser, Parser, StrParser};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     Str(String),
     Err(String),
@@ -81,9 +81,7 @@ impl Value {
 
 #[cfg(test)]
 mod tests {
-    use std::vec;
-
-use super::*;
+    use super::*;
     use io::{Cursor, BufRead, Seek};
 
     fn serialize_and_rewind(value: Value) -> Cursor<Vec<u8>> {
