@@ -4,12 +4,13 @@ use crate::resp_parser::RespError;
 
 
 pub fn handle_request(request: Value, storage: &Storage) -> Result<Value, RespError> {
-    if let Value::Arr(Some(arr)) = request {
+    if let Value::Arr(Some(mut arr)) = request {
         if arr.is_empty() {
             return Ok(Value::Err("request should be non-empty array".into()))
         }
-        if let Value::BulkStr(Some(cmd)) = &arr[0] {
-            let cmd = String::from_utf8(cmd.clone())?;
+        let cmd = std::mem::take(&mut arr[0]);
+        if let Value::BulkStr(Some(cmd)) = cmd {
+            let cmd = String::from_utf8(cmd)?;
             match cmd.to_lowercase().as_str() {
                 "ping" => {
                     return Ok(Value::Str("PONG".into()))
@@ -17,11 +18,58 @@ pub fn handle_request(request: Value, storage: &Storage) -> Result<Value, RespEr
                 "echo" => {
                     if arr.len() == 1 {
                         return Ok(Value::Err("ECHO with no argument received".into()))
-                    } else {
-                        if let Value::BulkStr(_) = arr[1] {
-                            return Ok(arr[1].clone())
+                    } else if arr.len() == 2 {
+                        let msg = arr.swap_remove(1);
+                        if let Value::BulkStr(_) = msg {
+                            return Ok(msg)
                         } else {
                             return Ok(Value::Err("ECHO's argument should be a bulk string".into()))
+                        }
+                    } else {
+                        return Ok(Value::Err(format!("ECHO requires 0 or 1 arguments, provided: {}", arr.len() - 1)))
+                    }
+                },
+                "set" => {
+                    if arr.len() != 3 {
+                        return Ok(Value::Err(format!("SET expects 2 arguments, provided: {}", arr.len() - 1)))
+                    } else {
+                        // Move the value and key out of `arr` (O(1), no cloning).
+                        // `arr` is owned here, and indices 2 then 1 are the last
+                        // elements at each step, so `swap_remove` just pops them.
+                        let value = arr.swap_remove(2);
+                        let key = arr.swap_remove(1);
+                        if let Value::BulkStr(Some(key)) = key {
+                            let mut guard = match storage.lock() {
+                                Ok(g) => g,
+                                Err(e) => {
+                                    return Ok(Value::Err(e.to_string()))
+                                }
+                            };
+                            guard.insert(key, value);
+                            return Ok(Value::Str("OK".into()))
+                        } else {
+                            return Ok(Value::Err("SET key is expected to be non-null bulk string".into()))
+                        }
+                    }
+                },
+                "get" => {
+                    if arr.len() != 2 {
+                        return Ok(Value::Err(format!("GET expects 1 argument, provided: {}", arr.len() - 1)))
+                    } else {
+                        let key = arr.swap_remove(1);
+                        if let Value::BulkStr(Some(key)) = key {
+                            let guard = match storage.lock() {
+                                Ok(g) => g,
+                                Err(e) => {
+                                    return Ok(Value::Err(e.to_string()))
+                                }
+                            };
+                            match guard.get(&key) {
+                                Some(val) => return Ok(val.clone()),
+                                None => return Ok(Value::BulkStr(None)),
+                            }
+                        } else {
+                            return Ok(Value::Err("GET key is expected to be non-null bulk string".into()))
                         }
                     }
                 },
@@ -38,6 +86,7 @@ pub fn handle_request(request: Value, storage: &Storage) -> Result<Value, RespEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_req_is_not_array() {
@@ -105,6 +154,86 @@ mod tests {
             ]));
             let response = handle_request(request, &Storage::default());
             assert_eq!(response, Ok(Value::BulkStr(Some("hello".into()))));
+        }
+    }
+
+    #[test]
+    fn test_set() {
+        let storage = Storage::default();
+        {   // 0 arguments provided
+            let request = Value::Arr(Some(vec![
+                Value::BulkStr(Some("Set".into())),
+            ]));
+            let response = handle_request(request, &storage);
+            assert_eq!(response, Ok(Value::Err("SET expects 2 arguments, provided: 0".into())));
+        }
+        {   // wrong type of key provided
+            let request = Value::Arr(Some(vec![
+                Value::BulkStr(Some("Set".into())),
+                Value::BulkStr(None),
+                Value::Str("val".into()),
+            ]));
+            let response = handle_request(request, &storage);
+            assert_eq!(response, Ok(Value::Err("SET key is expected to be non-null bulk string".into())));
+        }
+        {   // correct case
+            let request = Value::Arr(Some(vec![
+                Value::BulkStr(Some("Set".into())),
+                Value::BulkStr(Some("key1".into())),
+                Value::Str("val1".into()),
+            ]));
+            let response = handle_request(request, &storage);
+            assert_eq!(response, Ok(Value::Str("OK".into())));
+            let guard = storage.lock().unwrap();
+            assert_eq!(
+                *guard,
+                HashMap::from([(b"key1".to_vec(), Value::Str("val1".into()))])
+            );
+        }
+    }
+
+    #[test]
+    fn test_get() {
+        let storage = Storage::default();
+        storage.lock().unwrap().insert(
+          b"key1".into(),
+          Value::Int(100)  
+        );
+        {   // 0 arguments provided
+            let request = Value::Arr(Some(vec![
+                Value::BulkStr(Some("get".into())),
+            ]));
+            let response = handle_request(request, &storage);
+            assert_eq!(response, Ok(Value::Err("GET expects 1 argument, provided: 0".into())));
+        }
+        {   // wrong type of key provided
+            let request = Value::Arr(Some(vec![
+                Value::BulkStr(Some("gEt".into())),
+                Value::Int(1),
+            ]));
+            let response = handle_request(request, &storage);
+            assert_eq!(response, Ok(Value::Err("GET key is expected to be non-null bulk string".into())));
+        }
+        {   // non-existent key requested
+            let request = Value::Arr(Some(vec![
+                Value::BulkStr(Some("gEt".into())),
+                Value::BulkStr(Some("key2".into())),
+            ]));
+            let response = handle_request(request, &storage);
+            assert_eq!(response, Ok(Value::BulkStr(None)));
+        }
+        {   // correct case
+            let request = Value::Arr(Some(vec![
+                Value::BulkStr(Some("gEt".into())),
+                Value::BulkStr(Some("key1".into())),
+            ]));
+            let response = handle_request(request, &storage);
+            assert_eq!(response, Ok(Value::Int(100)));
+            let guard = storage.lock().unwrap();
+            assert_eq!(
+                *guard,
+                HashMap::from([(b"key1".to_vec(), Value::Int(100))])
+            );
         }
     }
 }

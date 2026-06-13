@@ -11,6 +11,12 @@ pub enum Value {
     Arr(Option<Vec<Value>>),
 }
 
+impl Default for Value {
+    fn default() -> Self {
+        Self::BulkStr(None)
+    }
+}
+
 impl Value {
     pub fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
         match self {
