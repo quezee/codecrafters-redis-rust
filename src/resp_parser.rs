@@ -2,6 +2,7 @@ use crate::resp_value::Value;
 
 use std::marker::Unpin;
 use std::{io, num::{ParseIntError, IntErrorKind}, string::FromUtf8Error};
+use core::str::Utf8Error;
 use tokio::io::{AsyncReadExt, AsyncBufReadExt};
 
 
@@ -16,6 +17,7 @@ pub enum RespError {
        kind: io::ErrorKind,
        msg: Option<String>
     },
+    Utf8(Utf8Error),
     FromUtf8(FromUtf8Error),
     ParseInt(IntErrorKind),
     WrongNullValue([u8; 4]),
@@ -25,6 +27,12 @@ pub enum RespError {
 impl From<io::Error> for RespError {
     fn from(value: io::Error) -> Self {
         Self::IO { kind: value.kind(), msg: Some(value.to_string()) }
+    }
+}
+
+impl From<Utf8Error> for RespError {
+    fn from(value: Utf8Error) -> Self {
+        Self::Utf8(value)
     }
 }
 

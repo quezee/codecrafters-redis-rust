@@ -1,6 +1,9 @@
-use crate::Storage;
+use crate::{Storage, Entry};
 use crate::resp_value::Value;
 use crate::resp_parser::RespError;
+
+use core::time::Duration;
+use std::time::Instant;
 
 
 pub fn handle_request(request: Value, storage: &Storage) -> Result<Value, RespError> {
@@ -30,12 +33,12 @@ pub fn handle_request(request: Value, storage: &Storage) -> Result<Value, RespEr
                     }
                 },
                 "set" => {
-                    if arr.len() != 3 {
-                        return Ok(Value::Err(format!("SET expects 2 arguments, provided: {}", arr.len() - 1)))
+                    if arr.len() != 3 && arr.len() != 5 {
+                        return Ok(Value::Err(format!("SET expects 2 or 4 arguments, provided: {}", arr.len() - 1)))
                     } else {
                         // Move the value and key out of `arr` (O(1), no cloning).
-                        // `arr` is owned here, and indices 2 then 1 are the last
-                        // elements at each step, so `swap_remove` just pops them.
+                        // - case w 2 arguments: indices 2 then 1 are the last elements at each step, so `swap_remove` just pops them
+                        // - case w 4 arguments: the 2 optional arguments are essentially moved to the beginning (preserving order)
                         let value = arr.swap_remove(2);
                         let key = arr.swap_remove(1);
                         if let Value::BulkStr(Some(key)) = key {
@@ -45,7 +48,35 @@ pub fn handle_request(request: Value, storage: &Storage) -> Result<Value, RespEr
                                     return Ok(Value::Err(e.to_string()))
                                 }
                             };
-                            guard.insert(key, value);
+                            let mut expires_at = None;
+                            if arr.len() == 3 {
+                                // Process expiration command
+                                let exp_type = &arr[1];
+                                let exp_time = &arr[2];
+                                if let Value::BulkStr(Some(exp_type)) = exp_type {
+                                    if let Value::BulkStr(Some(exp_time)) = exp_time {
+                                        let exp_type = exp_type.to_ascii_lowercase();
+                                        let exp_time: u64 = match std::str::from_utf8(exp_time) {
+                                            Ok(str) => match str.parse::<u64>() {
+                                                Ok(num) => num,
+                                                Err(e) => return Ok(Value::Err(format!("Expiration time parsing error: {}", e)))
+                                            },
+                                            Err(e) => return Ok(Value::Err(format!("Expiration time parsing error: {}", e)))
+                                        };
+                                        let dur = match exp_type.as_slice() {
+                                            b"px" | b"PX" | b"Px" | b"pX" => Duration::from_millis(exp_time),
+                                            b"ex" | b"EX" | b"Ex" | b"eX" => Duration::from_secs(exp_time),
+                                            _ => return Ok(Value::Err(format!("Unknown expiration type: {}", String::from_utf8_lossy(&exp_type))))
+                                        };
+                                        expires_at = Some(Instant::now() + dur);
+                                    } else {
+                                        return Ok(Value::Err("Unknown expiry time for SET provided".into()))
+                                    }
+                                } else {
+                                    return Ok(Value::Err("Unknown expiry type for SET provided".into()))
+                                }
+                            }
+                            guard.insert(key, Entry::new(value, expires_at));
                             return Ok(Value::Str("OK".into()))
                         } else {
                             return Ok(Value::Err("SET key is expected to be non-null bulk string".into()))
@@ -58,14 +89,20 @@ pub fn handle_request(request: Value, storage: &Storage) -> Result<Value, RespEr
                     } else {
                         let key = arr.swap_remove(1);
                         if let Value::BulkStr(Some(key)) = key {
-                            let guard = match storage.lock() {
+                            let mut guard = match storage.lock() {
                                 Ok(g) => g,
                                 Err(e) => {
                                     return Ok(Value::Err(e.to_string()))
                                 }
                             };
                             match guard.get(&key) {
-                                Some(val) => return Ok(val.clone()),
+                                Some(Entry{value, expires_at}) => {
+                                    if let Some(expires_at) = expires_at && *expires_at <= Instant::now() {
+                                        guard.remove(&key);
+                                        return Ok(Value::BulkStr(None))
+                                    }
+                                    return Ok(value.clone())
+                                },
                                 None => return Ok(Value::BulkStr(None)),
                             }
                         } else {
@@ -165,7 +202,7 @@ mod tests {
                 Value::BulkStr(Some("Set".into())),
             ]));
             let response = handle_request(request, &storage);
-            assert_eq!(response, Ok(Value::Err("SET expects 2 arguments, provided: 0".into())));
+            assert_eq!(response, Ok(Value::Err("SET expects 2 or 4 arguments, provided: 0".into())));
         }
         {   // wrong type of key provided
             let request = Value::Arr(Some(vec![
@@ -184,11 +221,37 @@ mod tests {
             ]));
             let response = handle_request(request, &storage);
             assert_eq!(response, Ok(Value::Str("OK".into())));
-            let guard = storage.lock().unwrap();
             assert_eq!(
-                *guard,
-                HashMap::from([(b"key1".to_vec(), Value::Str("val1".into()))])
+                *storage.lock().unwrap(),
+                HashMap::from([
+                    (b"key1".to_vec(), Value::Str("val1".into()).into())
+                ])
             );
+        }
+        {   // with exp
+            let set_request = Value::Arr(Some(vec![
+                Value::BulkStr(Some("set".into())),
+                Value::BulkStr(Some("foo".into())),
+                Value::Str("bar".into()),
+                Value::BulkStr(Some("px".into())),
+                Value::BulkStr(Some("100".into())),
+            ]));
+            let response = handle_request(set_request, &storage);
+            assert_eq!(response, Ok(Value::Str("OK".into())));
+
+            std::thread::sleep(Duration::from_millis(50));
+
+            let get_request = Value::Arr(Some(vec![
+                Value::BulkStr(Some("get".into())),
+                Value::BulkStr(Some("foo".into())),
+            ]));            
+            let response = handle_request(get_request.clone(), &storage);
+            assert_eq!(response, Ok(Value::Str("bar".into())));
+
+            std::thread::sleep(Duration::from_millis(51));
+
+            let response = handle_request(get_request, &storage);
+            assert_eq!(response, Ok(Value::BulkStr(None)));
         }
     }
 
@@ -197,7 +260,7 @@ mod tests {
         let storage = Storage::default();
         storage.lock().unwrap().insert(
           b"key1".into(),
-          Value::Int(100)  
+          Value::Int(100).into()
         );
         {   // 0 arguments provided
             let request = Value::Arr(Some(vec![
@@ -232,7 +295,9 @@ mod tests {
             let guard = storage.lock().unwrap();
             assert_eq!(
                 *guard,
-                HashMap::from([(b"key1".to_vec(), Value::Int(100))])
+                HashMap::from([
+                    (b"key1".to_vec(), Value::Int(100).into())
+                ])
             );
         }
     }
