@@ -1,114 +1,41 @@
-use crate::{Storage, Entry};
+use crate::{Storage, StorageEntry};
 use crate::resp_value::Value;
 use crate::resp_parser::RespError;
 
 use core::time::Duration;
 use std::time::Instant;
+use std::collections::hash_map::Entry;
 
 
 pub fn handle_request(request: Value, storage: &Storage) -> Result<Value, RespError> {
-    if let Value::Arr(Some(mut arr)) = request {
+    if let Value::Arr(Some(arr)) = request {
         if arr.is_empty() {
             return Ok(Value::Err("request should be non-empty array".into()))
         }
-        let cmd = std::mem::take(&mut arr[0]);
-        if let Value::BulkStr(Some(cmd)) = cmd {
+        let mut args = arr.into_iter();
+        let cmd = args.next();
+        if let Some(Value::BulkStr(Some(cmd))) = cmd {
             let cmd = String::from_utf8(cmd)?;
             match cmd.to_lowercase().as_str() {
                 "ping" => {
                     return Ok(Value::Str("PONG".into()))
                 },
                 "echo" => {
-                    if arr.len() == 1 {
-                        return Ok(Value::Err("ECHO with no argument received".into()))
-                    } else if arr.len() == 2 {
-                        let msg = arr.swap_remove(1);
-                        if let Value::BulkStr(_) = msg {
-                            return Ok(msg)
-                        } else {
-                            return Ok(Value::Err("ECHO's argument should be a bulk string".into()))
-                        }
-                    } else {
-                        return Ok(Value::Err(format!("ECHO requires 0 or 1 arguments, provided: {}", arr.len() - 1)))
-                    }
-                },
-                "set" => {
-                    if arr.len() != 3 && arr.len() != 5 {
-                        return Ok(Value::Err(format!("SET expects 2 or 4 arguments, provided: {}", arr.len() - 1)))
-                    } else {
-                        // Move the value and key out of `arr` (O(1), no cloning).
-                        // - case w 2 arguments: indices 2 then 1 are the last elements at each step, so `swap_remove` just pops them
-                        // - case w 4 arguments: the 2 optional arguments are essentially moved to the beginning (preserving order)
-                        let value = arr.swap_remove(2);
-                        let key = arr.swap_remove(1);
-                        if let Value::BulkStr(Some(key)) = key {
-                            let mut guard = match storage.lock() {
-                                Ok(g) => g,
-                                Err(e) => {
-                                    return Ok(Value::Err(e.to_string()))
-                                }
-                            };
-                            let mut expires_at = None;
-                            if arr.len() == 3 {
-                                // Process expiration command
-                                let exp_type = &arr[1];
-                                let exp_time = &arr[2];
-                                if let Value::BulkStr(Some(exp_type)) = exp_type {
-                                    if let Value::BulkStr(Some(exp_time)) = exp_time {
-                                        let exp_type = exp_type.to_ascii_lowercase();
-                                        let exp_time: u64 = match std::str::from_utf8(exp_time) {
-                                            Ok(str) => match str.parse::<u64>() {
-                                                Ok(num) => num,
-                                                Err(e) => return Ok(Value::Err(format!("Expiration time parsing error: {}", e)))
-                                            },
-                                            Err(e) => return Ok(Value::Err(format!("Expiration time parsing error: {}", e)))
-                                        };
-                                        let dur = match exp_type.as_slice() {
-                                            b"px" | b"PX" | b"Px" | b"pX" => Duration::from_millis(exp_time),
-                                            b"ex" | b"EX" | b"Ex" | b"eX" => Duration::from_secs(exp_time),
-                                            _ => return Ok(Value::Err(format!("Unknown expiration type: {}", String::from_utf8_lossy(&exp_type))))
-                                        };
-                                        expires_at = Some(Instant::now() + dur);
-                                    } else {
-                                        return Ok(Value::Err("Unknown expiry time for SET provided".into()))
-                                    }
-                                } else {
-                                    return Ok(Value::Err("Unknown expiry type for SET provided".into()))
-                                }
+                    match args.next() {
+                        Some(echo_arg) => {
+                            match echo_arg {
+                               Value::BulkStr(_) => return Ok(echo_arg),
+                               _ => return Ok(Value::Err("ECHO's argument should be a bulk string".into())),
                             }
-                            guard.insert(key, Entry::new(value, expires_at));
-                            return Ok(Value::Str("OK".into()))
-                        } else {
-                            return Ok(Value::Err("SET key is expected to be non-null bulk string".into()))
-                        }
+                        },
+                        None => return Ok(Value::Err("ECHO with no argument received".into())),
                     }
                 },
                 "get" => {
-                    if arr.len() != 2 {
-                        return Ok(Value::Err(format!("GET expects 1 argument, provided: {}", arr.len() - 1)))
-                    } else {
-                        let key = arr.swap_remove(1);
-                        if let Value::BulkStr(Some(key)) = key {
-                            let mut guard = match storage.lock() {
-                                Ok(g) => g,
-                                Err(e) => {
-                                    return Ok(Value::Err(e.to_string()))
-                                }
-                            };
-                            match guard.get(&key) {
-                                Some(Entry{value, expires_at}) => {
-                                    if let Some(expires_at) = expires_at && *expires_at <= Instant::now() {
-                                        guard.remove(&key);
-                                        return Ok(Value::BulkStr(None))
-                                    }
-                                    return Ok(value.clone())
-                                },
-                                None => return Ok(Value::BulkStr(None)),
-                            }
-                        } else {
-                            return Ok(Value::Err("GET key is expected to be non-null bulk string".into()))
-                        }
-                    }
+                    return handle_get_request(&mut args, storage);
+                },
+                "set" => {
+                    return handle_set_request(&mut args, storage);
                 },
                 _ => {
                     return Ok(Value::Err(format!("Unknown command: {}", cmd)))
@@ -117,6 +44,94 @@ pub fn handle_request(request: Value, storage: &Storage) -> Result<Value, RespEr
         }
     }
     Ok(Value::Err("request should be a non-null RESP array of bulk strings".into()))
+}
+
+
+fn handle_get_request(args: &mut impl Iterator<Item=Value>, storage: &Storage) -> Result<Value, RespError> {
+    match args.next() {
+        Some(Value::BulkStr(Some(key))) => {
+            match storage.lock() {
+                Ok(mut g) => {
+                    match g.entry(key) {
+                        Entry::Occupied(entry) => {
+                            if let Some(expires_at) = entry.get().expires_at && expires_at <= Instant::now() {
+                                entry.remove();
+                                return Ok(Value::BulkStr(None));
+                            }
+                            return Ok(entry.get().value.clone());
+                        },
+                        Entry::Vacant(_) => return Ok(Value::BulkStr(None))
+                    }
+                },
+                Err(msg) => {
+                    return Ok(Value::Err(format!("Lock poisoned: {}", msg.to_string())))
+                }
+            }
+        },
+        None => return Ok(Value::Err("GET expects 1 argument, provided: 0".into())),
+        _ => return Ok(Value::Err("GET key is expected to be non-null bulk string".into()))
+    }
+}
+
+struct SetOptArgs {
+    expires_at: Option<Instant>,
+}
+
+fn handle_set_request(args: &mut impl Iterator<Item=Value>, storage: &Storage) -> Result<Value, RespError> {
+    if let (Some(key), Some(value)) = (args.next(), args.next()) {
+        if let Value::BulkStr(Some(key)) = key {
+            let opt_args = match extract_set_opt_args(args) {
+                Ok(opt_args) => opt_args,
+                Err(msg) => return Ok(Value::Err(msg))
+            };
+            match storage.lock() {
+                Ok(mut g) => {
+                    g.insert(key, StorageEntry::new(value, opt_args.expires_at));
+                    return Ok(Value::Str("OK".into()))
+                },
+                Err(msg) => {
+                    return Ok(Value::Err(format!("Lock poisoned: {}", msg.to_string())))
+                }
+            }
+        } else {
+            return Ok(Value::Err("SET key is expected to be non-null bulk string".into()))
+        }
+    } else {
+        return Ok(Value::Err("SET expects at least 2 arguments".into()))
+    }
+
+}
+
+fn extract_set_opt_args(args: &mut impl Iterator<Item=Value>) -> Result<SetOptArgs, String> {
+    let mut expires_at = None;
+    if let Some(Value::BulkStr(Some(arg))) = args.next() {
+        match arg.as_slice() {
+            b"px" | b"PX" | b"Px" | b"pX" => {
+                let exp_time = parse_expire_time(args)?;
+                expires_at = Some(Instant::now() + Duration::from_millis(exp_time));
+            },
+            b"ex" | b"EX" | b"Ex" | b"eX" => {
+                let exp_time = parse_expire_time(args)?;
+                expires_at = Some(Instant::now() + Duration::from_secs(exp_time));
+            },
+            other => return Err(format!("Unknown optional command {}", String::from_utf8_lossy(other)))
+        }
+    }
+    Ok(SetOptArgs{expires_at})
+}
+
+fn parse_expire_time(args: &mut impl Iterator<Item=Value>) -> Result<u64, String> {
+    if let Some(Value::BulkStr(Some(exp_time))) = args.next() {
+        match std::str::from_utf8(&exp_time) {
+            Ok(str) => match str.parse::<u64>() {
+                Ok(num) => Ok(num),
+                Err(e) => Err(format!("Expiration time parsing error: {}", e))
+            },
+            Err(e) => Err(format!("Expiration time parsing error: {}", e))
+        }
+    } else {
+        return Err("Unknown expire time for SET provided".into())
+    }
 }
 
 
@@ -202,7 +217,7 @@ mod tests {
                 Value::BulkStr(Some("Set".into())),
             ]));
             let response = handle_request(request, &storage);
-            assert_eq!(response, Ok(Value::Err("SET expects 2 or 4 arguments, provided: 0".into())));
+            assert_eq!(response, Ok(Value::Err("SET expects at least 2 arguments".into())));
         }
         {   // wrong type of key provided
             let request = Value::Arr(Some(vec![
