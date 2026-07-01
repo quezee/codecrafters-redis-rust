@@ -37,6 +37,9 @@ pub fn handle_request(request: Value, storage: &Storage) -> Result<Value, RespEr
                 "set" => {
                     return handle_set_request(&mut args, storage);
                 },
+                "rpush" => {
+                    return handle_rpush_request(&mut args, storage);
+                },
                 _ => {
                     return Ok(Value::Err(format!("Unknown command: {}", cmd)))
                 }
@@ -131,6 +134,32 @@ fn parse_expire_time(args: &mut impl Iterator<Item=Value>) -> Result<u64, String
         }
     } else {
         return Err("Unknown expire time for SET provided".into())
+    }
+}
+
+fn handle_rpush_request(args: &mut impl Iterator<Item=Value>, storage: &Storage) -> Result<Value, RespError> {
+    if let (Some(key), Some(value)) = (args.next(), args.next()) {
+        if let Value::BulkStr(Some(key)) = key {
+            match storage.lock() {
+                Ok(mut g) => {
+                    let arr = g.entry(key)
+                        .or_insert_with(|| Value::Arr(Some(vec![])).into());
+                    if let Value::Arr(Some(arr)) = &mut arr.value {
+                        arr.push(value);
+                        return Ok(Value::Int(arr.len() as i64));
+                    } else {
+                        return Ok(Value::Err(format!("WRONGTYPE for list: {:?}", arr.value)))
+                    }
+                },
+                Err(msg) => {
+                    return Ok(Value::Err(format!("Lock poisoned: {}", msg.to_string())))
+                }
+            }
+        } else {
+            return Ok(Value::Err("RPUSH key is expected to be non-null bulk string".into()))
+        }
+    } else {
+        return Ok(Value::Err("RPUSH expects 2 arguments: key and value".into()))
     }
 }
 
@@ -267,6 +296,62 @@ mod tests {
 
             let response = handle_request(get_request, &storage);
             assert_eq!(response, Ok(Value::BulkStr(None)));
+        }
+    }
+
+    #[test]
+    fn test_rpush() {
+        let storage = Storage::default();
+        {   // 0 arguments provided
+            let request = Value::Arr(Some(vec![
+                Value::BulkStr(Some("rpush".into())),
+            ]));
+            let response = handle_request(request, &storage);
+            assert_eq!(response, Ok(Value::Err("RPUSH expects 2 arguments: key and value".into())));
+        }
+        {   // wrongtype
+            let request1 = Value::Arr(Some(vec![
+                Value::BulkStr(Some("Set".into())),
+                Value::BulkStr(Some("key".into())),
+                Value::Int(1),
+            ]));
+            let response1 = handle_request(request1, &storage);
+            assert_eq!(response1, Ok(Value::Str("OK".into())));
+
+            let request2 = Value::Arr(Some(vec![
+                Value::BulkStr(Some("Rpush".into())),
+                Value::BulkStr(Some("key".into())),
+                Value::Int(1),
+            ]));
+            let response2 = handle_request(request2, &storage);
+            assert_eq!(response2, Ok(Value::Err("WRONGTYPE for list: Int(1)".into())));
+        }
+        {   // correct case
+            let request1 = Value::Arr(Some(vec![
+                Value::BulkStr(Some("rpush".into())),
+                Value::BulkStr(Some("lst".into())),
+                Value::Int(1),
+            ]));
+            let response1 = handle_request(request1, &storage);
+            assert_eq!(response1, Ok(Value::Int(1)));
+
+            let request2 = Value::Arr(Some(vec![
+                Value::BulkStr(Some("Rpush".into())),
+                Value::BulkStr(Some("lst".into())),
+                Value::Str("two".into()),
+            ]));
+            let response2 = handle_request(request2, &storage);
+            assert_eq!(response2, Ok(Value::Int(2)));
+
+            let request3 = Value::Arr(Some(vec![
+                Value::BulkStr(Some("Get".into())),
+                Value::BulkStr(Some("lst".into())),
+            ]));
+            let response3 = handle_request(request3, &storage);
+            assert_eq!(
+                response3,
+                Ok(Value::Arr(Some(vec![Value::Int(1), Value::Str("two".into())])))
+            );
         }
     }
 
