@@ -138,14 +138,17 @@ fn parse_expire_time(args: &mut impl Iterator<Item=Value>) -> Result<u64, String
 }
 
 fn handle_rpush_request(args: &mut impl Iterator<Item=Value>, storage: &Storage) -> Result<Value, RespError> {
-    if let (Some(key), Some(value)) = (args.next(), args.next()) {
+    let key = args.next();
+    let mut vals: Vec<Value> = args.collect();
+
+    if let Some(key) = key && vals.len() > 0 {
         if let Value::BulkStr(Some(key)) = key {
             match storage.lock() {
                 Ok(mut g) => {
                     let arr = g.entry(key)
                         .or_insert_with(|| Value::Arr(Some(vec![])).into());
                     if let Value::Arr(Some(arr)) = &mut arr.value {
-                        arr.push(value);
+                        arr.append(&mut vals);
                         return Ok(Value::Int(arr.len() as i64));
                     } else {
                         return Ok(Value::Err(format!("WRONGTYPE for list: {:?}", arr.value)))
@@ -159,7 +162,7 @@ fn handle_rpush_request(args: &mut impl Iterator<Item=Value>, storage: &Storage)
             return Ok(Value::Err("RPUSH key is expected to be non-null bulk string".into()))
         }
     } else {
-        return Ok(Value::Err("RPUSH expects 2 arguments: key and value".into()))
+        return Ok(Value::Err("USAGE: RPUSH <key> <vals...>".into()))
     }
 }
 
@@ -307,7 +310,7 @@ mod tests {
                 Value::BulkStr(Some("rpush".into())),
             ]));
             let response = handle_request(request, &storage);
-            assert_eq!(response, Ok(Value::Err("RPUSH expects 2 arguments: key and value".into())));
+            assert_eq!(response, Ok(Value::Err("USAGE: RPUSH <key> <vals...>".into())));
         }
         {   // wrongtype
             let request1 = Value::Arr(Some(vec![
@@ -351,6 +354,35 @@ mod tests {
             assert_eq!(
                 response3,
                 Ok(Value::Arr(Some(vec![Value::Int(1), Value::Str("two".into())])))
+            );
+        }
+        {   // correct case : multiple vals
+            let request1 = Value::Arr(Some(vec![
+                Value::BulkStr(Some("rpush".into())),
+                Value::BulkStr(Some("key10".into())),
+                Value::Int(1), Value::Str("2".into()), Value::Int(3) 
+            ]));
+            let response1 = handle_request(request1, &storage);
+            assert_eq!(response1, Ok(Value::Int(3)));
+
+            let request2 = Value::Arr(Some(vec![
+                Value::BulkStr(Some("rpush".into())),
+                Value::BulkStr(Some("key10".into())),
+                Value::Int(4), Value::Int(5) 
+            ]));
+            let response2 = handle_request(request2, &storage);
+            assert_eq!(response2, Ok(Value::Int(5)));
+
+            let request3 = Value::Arr(Some(vec![
+                Value::BulkStr(Some("Get".into())),
+                Value::BulkStr(Some("key10".into())),
+            ]));
+            let response3 = handle_request(request3, &storage);
+            assert_eq!(
+                response3,
+                Ok(Value::Arr(Some(vec![
+                    Value::Int(1), Value::Str("2".into()), Value::Int(3), Value::Int(4), Value::Int(5)
+                ])))
             );
         }
     }
