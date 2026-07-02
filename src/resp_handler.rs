@@ -40,6 +40,9 @@ pub fn handle_request(request: Value, storage: &Storage) -> Result<Value, RespEr
                 "rpush" => {
                     return handle_rpush_request(&mut args, storage);
                 },
+                "lrange" => {
+                    return handle_lrange_request(&mut args, storage);
+                },
                 _ => {
                     return Ok(Value::Err(format!("Unknown command: {}", cmd)))
                 }
@@ -110,11 +113,13 @@ fn extract_set_opt_args(args: &mut impl Iterator<Item=Value>) -> Result<SetOptAr
     if let Some(Value::BulkStr(Some(arg))) = args.next() {
         match arg.as_slice() {
             b"px" | b"PX" | b"Px" | b"pX" => {
-                let exp_time = parse_expire_time(args)?;
+                let exp_time = args.next().ok_or("expiration time not provided")?;
+                let exp_time: u64 = convert_bulk_str(exp_time)?;
                 expires_at = Some(Instant::now() + Duration::from_millis(exp_time));
             },
             b"ex" | b"EX" | b"Ex" | b"eX" => {
-                let exp_time = parse_expire_time(args)?;
+                let exp_time = args.next().ok_or("expiration time not provided")?;
+                let exp_time: u64 = convert_bulk_str(exp_time)?;
                 expires_at = Some(Instant::now() + Duration::from_secs(exp_time));
             },
             other => return Err(format!("Unknown optional command {}", String::from_utf8_lossy(other)))
@@ -123,17 +128,21 @@ fn extract_set_opt_args(args: &mut impl Iterator<Item=Value>) -> Result<SetOptAr
     Ok(SetOptArgs{expires_at})
 }
 
-fn parse_expire_time(args: &mut impl Iterator<Item=Value>) -> Result<u64, String> {
-    if let Some(Value::BulkStr(Some(exp_time))) = args.next() {
-        match std::str::from_utf8(&exp_time) {
-            Ok(str) => match str.parse::<u64>() {
+fn convert_bulk_str<T>(val: Value) -> Result<T, String>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display
+{
+    if let Value::BulkStr(Some(val)) = val {
+        match std::str::from_utf8(&val) {
+            Ok(str) => match str.parse::<T>() {
                 Ok(num) => Ok(num),
-                Err(e) => Err(format!("Expiration time parsing error: {}", e))
+                Err(e) => Err(format!("BulkStr parsing error: {}", e))
             },
-            Err(e) => Err(format!("Expiration time parsing error: {}", e))
+            Err(e) => Err(format!("BulkStr parsing error: {}", e))
         }
     } else {
-        return Err("Unknown expire time for SET provided".into())
+        return Err("Non-null BulkStr expected".into())
     }
 }
 
@@ -165,6 +174,49 @@ fn handle_rpush_request(args: &mut impl Iterator<Item=Value>, storage: &Storage)
         return Ok(Value::Err("USAGE: RPUSH <key> <vals...>".into()))
     }
 }
+
+fn handle_lrange_request(args: &mut impl Iterator<Item=Value>, storage: &Storage) -> Result<Value, RespError> {
+    let key = args.next();
+    let start = args.next();
+    let stop = args.next();
+
+    if let (
+        Some(Value::BulkStr(Some(key))),
+        Some(start),
+        Some(stop)
+    ) = (key, start, stop) {
+        let start: i64 = match convert_bulk_str(start) {
+            Ok(idx) => idx,
+            Err(msg) => return Ok(Value::Err(msg)),
+        };
+        let mut stop: i64 = match convert_bulk_str(stop) {
+            Ok(idx) => idx,
+            Err(msg) => return Ok(Value::Err(msg)),
+        };
+        match storage.lock() {
+            Ok(g) => {
+                let lst = g.get(&key);
+                if let Some(StorageEntry{value: Value::Arr(Some(arr)), expires_at: _}) = lst {
+                    if start >= arr.len() as i64 || start > stop {
+                        return Ok(Value::Arr(Some(vec![])))
+                    }
+                    if stop >= arr.len() as i64 {
+                        stop = arr.len() as i64 - 1;
+                    }
+                    return Ok(Value::Arr(Some(arr[start as usize..=stop as usize].into())))
+                } else {
+                    return Ok(Value::Arr(Some(vec![])))
+                }
+            },
+            Err(msg) => {
+                return Ok(Value::Err(format!("Lock poisoned: {}", msg.to_string())))
+            }
+        }
+    } else {
+        return Ok(Value::Err("USAGE: LRANGE <key> <start> <stop>".into()))
+    }
+}
+
 
 
 #[cfg(test)]
@@ -382,6 +434,32 @@ mod tests {
                 response3,
                 Ok(Value::Arr(Some(vec![
                     Value::Int(1), Value::Str("2".into()), Value::Int(3), Value::Int(4), Value::Int(5)
+                ])))
+            );
+        }
+    }
+
+    #[test]
+    fn test_lrange() {
+        let storage = Storage::default();
+        storage.lock().unwrap().insert(
+            b"key1".into(),
+            Value::Arr(Some(vec![
+                Value::Int(1), Value::Str("2".into()), Value::Int(3), Value::Int(4), Value::Int(5)
+            ])).into()
+        );
+        {
+            let request = Value::Arr(Some(vec![
+                Value::BulkStr(Some("lrange".into())),
+                Value::BulkStr(Some("key1".into())),
+                Value::BulkStr(Some("1".into())),
+                Value::BulkStr(Some("3".into())),
+            ]));
+            let response = handle_request(request, &storage);
+            assert_eq!(
+                response,
+                Ok(Value::Arr(Some(vec![
+                    Value::Str("2".into()), Value::Int(3), Value::Int(4)
                 ])))
             );
         }
