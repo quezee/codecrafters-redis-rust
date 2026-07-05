@@ -189,7 +189,7 @@ fn handle_lrange_request(args: &mut impl Iterator<Item=Value>, storage: &Storage
             Ok(idx) => idx,
             Err(msg) => return Ok(Value::Err(msg)),
         };
-        let mut stop: i64 = match convert_bulk_str(stop) {
+        let stop: i64 = match convert_bulk_str(stop) {
             Ok(idx) => idx,
             Err(msg) => return Ok(Value::Err(msg)),
         };
@@ -197,13 +197,12 @@ fn handle_lrange_request(args: &mut impl Iterator<Item=Value>, storage: &Storage
             Ok(g) => {
                 let lst = g.get(&key);
                 if let Some(StorageEntry{value: Value::Arr(Some(arr)), expires_at: _}) = lst {
-                    if start >= arr.len() as i64 || start > stop {
+                    let start = process_index(start, arr.len());
+                    let stop = process_index(stop, arr.len());
+                    if start > stop {
                         return Ok(Value::Arr(Some(vec![])))
                     }
-                    if stop >= arr.len() as i64 {
-                        stop = arr.len() as i64 - 1;
-                    }
-                    return Ok(Value::Arr(Some(arr[start as usize..=stop as usize].into())))
+                    return Ok(Value::Arr(Some(arr[start..=stop].into())))
                 } else {
                     return Ok(Value::Arr(Some(vec![])))
                 }
@@ -217,6 +216,18 @@ fn handle_lrange_request(args: &mut impl Iterator<Item=Value>, storage: &Storage
     }
 }
 
+fn process_index(idx: i64, list_len: usize) -> usize {
+    if idx >= 0 {
+        let idx = idx as usize;
+        if idx >= list_len {
+            list_len - 1
+        } else {
+            idx
+        }
+    } else {
+        list_len.saturating_sub(-idx as usize)
+    }
+}
 
 
 #[cfg(test)]
@@ -448,7 +459,7 @@ mod tests {
                 Value::Int(1), Value::Str("2".into()), Value::Int(3), Value::Int(4), Value::Int(5)
             ])).into()
         );
-        {
+        {   // pos indices
             let request = Value::Arr(Some(vec![
                 Value::BulkStr(Some("lrange".into())),
                 Value::BulkStr(Some("key1".into())),
@@ -460,6 +471,21 @@ mod tests {
                 response,
                 Ok(Value::Arr(Some(vec![
                     Value::Str("2".into()), Value::Int(3), Value::Int(4)
+                ])))
+            );
+        }
+        {   // neg indices
+            let request = Value::Arr(Some(vec![
+                Value::BulkStr(Some("lrange".into())),
+                Value::BulkStr(Some("key1".into())),
+                Value::BulkStr(Some("-3".into())),
+                Value::BulkStr(Some("-1".into())),
+            ]));
+            let response = handle_request(request, &storage);
+            assert_eq!(
+                response,
+                Ok(Value::Arr(Some(vec![
+                    Value::Int(3), Value::Int(4), Value::Int(5)
                 ])))
             );
         }
