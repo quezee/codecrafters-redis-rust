@@ -287,12 +287,27 @@ fn handle_llen_request(args: &mut impl Iterator<Item=Value>, storage: &Storage) 
 }
 
 fn handle_lpop_request(args: &mut impl Iterator<Item=Value>, storage: &Storage) -> Result<Value, RespError> {
-    if let Some(Value::BulkStr(Some(key))) = args.next() {
+    let key = args.next();
+    let count = args.next();
+
+    if let Some(Value::BulkStr(Some(key))) = key {
         match storage.lock() {
             Ok(mut guard) => {
                 match guard.get_mut(&key) {
                     Some(StorageEntry{value: StoredValue::List(lst), expires_at: _}) => {
-                        return Ok(Value::BulkStr(lst.pop_front()))
+                        if let Some(val) = count && let Value::BulkStr(Some(_)) = val {
+                            let count: usize = match convert_bulk_str(val) {
+                                Ok(num) => std::cmp::min(num, lst.len()),
+                                Err(msg) => return Ok(Value::Err(msg))
+                            };
+                            let mut popped = vec![];
+                            for _ in 0..count {
+                                popped.push(Value::BulkStr(lst.pop_front()));
+                            }
+                            return Ok(Value::Arr(Some(popped)))
+                        } else {
+                            return Ok(Value::BulkStr(lst.pop_front()))
+                        }
                     },
                     Some(_) => {
                         return Ok(Value::Err("WRONGTYPE: value is not a list".into()))
@@ -307,7 +322,7 @@ fn handle_lpop_request(args: &mut impl Iterator<Item=Value>, storage: &Storage) 
             }            
         }
     } else {
-        return Ok(Value::Err("USAGE: LLEN <key>".into()))
+        return Ok(Value::Err("USAGE: LLEN <key> <count?>".into()))
     }
 }
 
@@ -717,7 +732,13 @@ mod tests {
                 "1".into(), "2".into()
             ]).into()
         );
-        {
+        storage.lock().unwrap().insert(
+            b"key2".into(),
+            LinkedList::from([
+                "a".into(), "b".into(), "c".into()
+            ]).into()
+        );
+        {   // without count
             let request1 = Value::Arr(Some(vec![
                 Value::BulkStr(Some("lpop".into())),
                 Value::BulkStr(Some("key1".into())),
@@ -746,6 +767,33 @@ mod tests {
             assert_eq!(
                 response3,
                 Ok(Value::BulkStr(None))
+            );
+        }
+        {   // with count
+            let request1 = Value::Arr(Some(vec![
+                Value::BulkStr(Some("lpop".into())),
+                Value::BulkStr(Some("key2".into())),
+                Value::BulkStr(Some("5".into())),
+            ]));
+            let response1 = handle_request(request1, &storage);
+            assert_eq!(
+                response1,
+                Ok(Value::Arr(Some(vec![
+                    Value::BulkStr(Some("a".into())),
+                    Value::BulkStr(Some("b".into())),
+                    Value::BulkStr(Some("c".into())),
+                ])))
+            );
+
+            let request2 = Value::Arr(Some(vec![
+                Value::BulkStr(Some("lpop".into())),
+                Value::BulkStr(Some("key1".into())),
+                Value::BulkStr(Some("1".into())),
+            ]));
+            let response2 = handle_request(request2, &storage);
+            assert_eq!(
+                response2,
+                Ok(Value::Arr(Some(vec![])))
             );
         }
     }
