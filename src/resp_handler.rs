@@ -1,4 +1,4 @@
-use crate::{Bytes, Storage, StoredValue, StorageEntry};
+use crate::{Storage, StoredValue, StorageEntry};
 use crate::resp_value::Value;
 use crate::resp_parser::RespError;
 
@@ -43,6 +43,9 @@ pub fn handle_request(request: Value, storage: &Storage) -> Result<Value, RespEr
                 },
                 "lrange" => {
                     return handle_lrange_request(&mut args, storage);
+                },
+                "llen" => {
+                    return handle_llen_request(&mut args, storage);
                 },
                 _ => {
                     return Ok(Value::Err(format!("Unknown command: {}", cmd)))
@@ -252,6 +255,31 @@ fn process_index(idx: i64, list_len: usize) -> usize {
         }
     } else {
         list_len.saturating_sub(-idx as usize)
+    }
+}
+
+fn handle_llen_request(args: &mut impl Iterator<Item=Value>, storage: &Storage) -> Result<Value, RespError> {
+    if let Some(Value::BulkStr(Some(key))) = args.next() {
+        match storage.lock() {
+            Ok(guard) => {
+                match guard.get(&key) {
+                    Some(StorageEntry{value: StoredValue::List(lst), expires_at: _}) => {
+                        return Ok(Value::Int(lst.len() as i64))
+                    },
+                    Some(_) => {
+                        return Ok(Value::Err("WRONGTYPE: value is not a list".into()))
+                    }
+                    None => {
+                        return Ok(Value::Int(0))
+                    }
+                }
+            },
+            Err(msg) => {
+                return Ok(Value::Err(format!("Lock poisoned: {}", msg.to_string())))
+            }            
+        }
+    } else {
+        return Ok(Value::Err("USAGE: LLEN <key>".into()))
     }
 }
 
@@ -616,6 +644,39 @@ mod tests {
                 HashMap::from([
                     (b"key1".to_vec(), Value::Int(100).into())
                 ])
+            );
+        }
+    }
+
+    #[test]
+    fn test_llen() {
+        let storage = Storage::default();
+        storage.lock().unwrap().insert(
+            b"key1".into(),
+            LinkedList::from([
+                "1".into(), "2".into(), "3".into(), "4".into(), "5".into()
+            ]).into()
+        );
+        {   // absent key
+            let request = Value::Arr(Some(vec![
+                Value::BulkStr(Some("llen".into())),
+                Value::BulkStr(Some("absent".into())),
+            ]));
+            let response = handle_request(request, &storage);
+            assert_eq!(
+                response,
+                Ok(Value::Int(0))
+            );
+        }
+        {   // existing key
+            let request = Value::Arr(Some(vec![
+                Value::BulkStr(Some("llen".into())),
+                Value::BulkStr(Some("key1".into())),
+            ]));
+            let response = handle_request(request, &storage);
+            assert_eq!(
+                response,
+                Ok(Value::Int(5))
             );
         }
     }
