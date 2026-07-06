@@ -16,8 +16,8 @@ pub fn handle_request(request: Value, storage: &Storage) -> Result<Value, RespEr
         let mut args = arr.into_iter();
         let cmd = args.next();
         if let Some(Value::BulkStr(Some(cmd))) = cmd {
-            let cmd = String::from_utf8(cmd)?;
-            match cmd.to_lowercase().as_str() {
+            let cmd = String::from_utf8(cmd)?.to_lowercase();
+            match cmd.as_str() {
                 "ping" => {
                     return Ok(Value::Str("PONG".into()))
                 },
@@ -38,8 +38,8 @@ pub fn handle_request(request: Value, storage: &Storage) -> Result<Value, RespEr
                 "set" => {
                     return handle_set_request(&mut args, storage);
                 },
-                "rpush" => {
-                    return handle_rpush_request(&mut args, storage);
+                "rpush" | "lpush" => {
+                    return handle_push_request(&mut args, storage, &cmd);
                 },
                 "lrange" => {
                     return handle_lrange_request(&mut args, storage);
@@ -151,7 +151,7 @@ where
     }
 }
 
-fn handle_rpush_request(args: &mut impl Iterator<Item=Value>, storage: &Storage) -> Result<Value, RespError> {
+fn handle_push_request(args: &mut impl Iterator<Item=Value>, storage: &Storage, cmd: &str) -> Result<Value, RespError> {
     let key = args.next();
 
     let mut vals = LinkedList::new();
@@ -171,7 +171,15 @@ fn handle_rpush_request(args: &mut impl Iterator<Item=Value>, storage: &Storage)
                     let list = g.entry(key)
                         .or_insert_with(|| LinkedList::new().into());
                     if let StoredValue::List(list) = &mut list.value {
-                        list.append(&mut vals);
+                        match cmd {
+                            "rpush" => list.append(&mut vals),
+                            "lpush" => {
+                                while let Some(val) = vals.pop_front() {
+                                    list.push_front(val);
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
                         return Ok(Value::Int(list.len() as i64));
                     } else {
                         return Ok(Value::Err(format!("WRONGTYPE for RPUSH: {:?}", list.value)))
@@ -384,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rpush() {
+    fn test_push() {
         let storage = Storage::default();
         {   // 0 arguments provided
             let request = Value::Arr(Some(vec![
@@ -410,7 +418,7 @@ mod tests {
             let response2 = handle_request(request2, &storage);
             assert_eq!(response2, Ok(Value::Err("Lists store only bulk strings".into())));
         }
-        {   // correct case
+        {   // RPUSH: correct case
             let request1 = Value::Arr(Some(vec![
                 Value::BulkStr(Some("rpush".into())),
                 Value::BulkStr(Some("lst".into())),
@@ -442,7 +450,7 @@ mod tests {
                 ])))
             );
         }
-        {   // correct case : multiple vals
+        {   // RPUSH: correct case, multiple vals
             let request1 = Value::Arr(Some(vec![
                 Value::BulkStr(Some("rpush".into())),
                 Value::BulkStr(Some("key10".into())),
@@ -477,6 +485,44 @@ mod tests {
                     Value::BulkStr(Some("3".into())),
                     Value::BulkStr(Some("4".into())),
                     Value::BulkStr(Some("5".into())),
+                ])))
+            );
+        }
+        {   // LPUSH: correct case, multiple vals
+            let request1 = Value::Arr(Some(vec![
+                Value::BulkStr(Some("lpush".into())),
+                Value::BulkStr(Some("key11".into())),
+                Value::BulkStr(Some("4".into())),
+                Value::BulkStr(Some("3".into())),
+            ]));
+            let response1 = handle_request(request1, &storage);
+            assert_eq!(response1, Ok(Value::Int(2)));
+
+            let request2 = Value::Arr(Some(vec![
+                Value::BulkStr(Some("lpush".into())),
+                Value::BulkStr(Some("key11".into())),
+                Value::BulkStr(Some("2".into())),
+                Value::BulkStr(Some("1".into())),
+                Value::BulkStr(Some("0".into())),
+            ]));
+            let response2 = handle_request(request2, &storage);
+            assert_eq!(response2, Ok(Value::Int(5)));
+
+            let request3 = Value::Arr(Some(vec![
+                Value::BulkStr(Some("LRANGE".into())),
+                Value::BulkStr(Some("key11".into())),
+                Value::BulkStr(Some("0".into())),
+                Value::BulkStr(Some("-1".into())),
+            ]));
+            let response3 = handle_request(request3, &storage);
+            assert_eq!(
+                response3,
+                Ok(Value::Arr(Some(vec![
+                    Value::BulkStr(Some("0".into())),
+                    Value::BulkStr(Some("1".into())),
+                    Value::BulkStr(Some("2".into())),
+                    Value::BulkStr(Some("3".into())),
+                    Value::BulkStr(Some("4".into())),
                 ])))
             );
         }
