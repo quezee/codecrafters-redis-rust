@@ -47,6 +47,9 @@ pub fn handle_request(request: Value, storage: &Storage) -> Result<Value, RespEr
                 "llen" => {
                     return handle_llen_request(&mut args, storage);
                 },
+                "lpop" => {
+                    return handle_lpop_request(&mut args, storage);
+                },
                 _ => {
                     return Ok(Value::Err(format!("Unknown command: {}", cmd)))
                 }
@@ -283,6 +286,30 @@ fn handle_llen_request(args: &mut impl Iterator<Item=Value>, storage: &Storage) 
     }
 }
 
+fn handle_lpop_request(args: &mut impl Iterator<Item=Value>, storage: &Storage) -> Result<Value, RespError> {
+    if let Some(Value::BulkStr(Some(key))) = args.next() {
+        match storage.lock() {
+            Ok(mut guard) => {
+                match guard.get_mut(&key) {
+                    Some(StorageEntry{value: StoredValue::List(lst), expires_at: _}) => {
+                        return Ok(Value::BulkStr(lst.pop_front()))
+                    },
+                    Some(_) => {
+                        return Ok(Value::Err("WRONGTYPE: value is not a list".into()))
+                    }
+                    None => {
+                        return Ok(Value::default())
+                    }
+                }
+            },
+            Err(msg) => {
+                return Ok(Value::Err(format!("Lock poisoned: {}", msg.to_string())))
+            }            
+        }
+    } else {
+        return Ok(Value::Err("USAGE: LLEN <key>".into()))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -677,6 +704,48 @@ mod tests {
             assert_eq!(
                 response,
                 Ok(Value::Int(5))
+            );
+        }
+    }
+
+    #[test]
+    fn test_lpop() {
+        let storage = Storage::default();
+        storage.lock().unwrap().insert(
+            b"key1".into(),
+            LinkedList::from([
+                "1".into(), "2".into()
+            ]).into()
+        );
+        {
+            let request1 = Value::Arr(Some(vec![
+                Value::BulkStr(Some("lpop".into())),
+                Value::BulkStr(Some("key1".into())),
+            ]));
+            let response1 = handle_request(request1, &storage);
+            assert_eq!(
+                response1,
+                Ok(Value::BulkStr(Some("1".into())))
+            );
+
+            let request2 = Value::Arr(Some(vec![
+                Value::BulkStr(Some("lpop".into())),
+                Value::BulkStr(Some("key1".into())),
+            ]));
+            let response2 = handle_request(request2, &storage);
+            assert_eq!(
+                response2,
+                Ok(Value::BulkStr(Some("2".into())))
+            );
+
+            let request3 = Value::Arr(Some(vec![
+                Value::BulkStr(Some("lpop".into())),
+                Value::BulkStr(Some("key1".into())),
+            ]));
+            let response3 = handle_request(request3, &storage);
+            assert_eq!(
+                response3,
+                Ok(Value::BulkStr(None))
             );
         }
     }
